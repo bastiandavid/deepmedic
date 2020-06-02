@@ -20,7 +20,7 @@ from deepmedic.neuralnet.wrappers import CnnWrapperForSampling
 from deepmedic.dataManagement.sampling import get_samples_for_subepoch
 from deepmedic.routines.testing import inference_on_whole_volumes
 
-from deepmedic.logging.utils import datetime_now_str
+from deepmedic.logging.utils import datetime_now_str, print_progress_step_tr_val
 
 
 def process_in_batches(log,
@@ -38,16 +38,12 @@ def process_in_batches(log,
     # Each row of array below holds number of:
     #     Real Positives, Real Neg, True Predicted Pos, True Predicted Neg in subepoch, in this order.
     arr_RpRnTpTn_per_class_in_subep = np.zeros([cnn3d.num_classes, 4], dtype="int32")
-
-    print_progress_step = max(1, n_batches // 5)
-
+    
+    prefix_progress_str = '[TRAINING]' if train_or_val == 'train' else '[VALIDATION]'
+    print_progress_step_tr_val(log, n_batches, 0, batchsize, prefix_progress_str)
     for batch_i in range(n_batches):
 
         if train_or_val == "train":
-            if batch_i == 0 or ((batch_i + 1) % print_progress_step) == 0 or (batch_i + 1) == n_batches:
-                log.print3("[TRAINING] Trained on " + str(batch_i + 1) + "/" + str(n_batches) +\
-                           " batches for this subepoch...")
-
             ops_to_fetch = cnn3d.get_main_ops('train')
             list_of_ops = [ops_to_fetch['cost']] + ops_to_fetch['list_rp_rn_tp_tn'] +\
                             [ops_to_fetch['updates_grouped_op']]
@@ -64,16 +60,12 @@ def process_in_batches(log,
             # Training step. Returns a list containing the results of fetched ops.
             results_of_run = sessionTf.run(fetches=list_of_ops, feed_dict=feeds_dict)
 
-            cnn3d.updateMatricesOfBnMovingAvForInference(sessionTf)  # I should put this inside the model.
+            cnn3d.update_arrays_of_bn_moving_avg(sessionTf)  # I should put this inside the model.
 
             cost_this_batch = results_of_run[0]
             list_RpRnPpPn_per_class = results_of_run[1:-1]  # [-1] is from updates_grouped_op, returns nothing
-
+            
         else:  # validation
-            if batch_i == 0 or ((batch_i + 1) % print_progress_step) == 0 or (batch_i + 1) == n_batches:
-                log.print3("[VALIDATION] Validated on " +
-                           str(batch_i + 1) + "/" + str(n_batches) + " batches for this subepoch...")
-
             ops_to_fetch = cnn3d.get_main_ops('val')
             list_of_ops = ops_to_fetch['list_rp_rn_tp_tn']
 
@@ -91,7 +83,7 @@ def process_in_batches(log,
 
             cost_this_batch = 999  # placeholder in case of validation.
             list_RpRnPpPn_per_class = results_of_run
-
+        
         # list_RpRnPpPn_per_class holds Real Pos, Real Neg, True Pred Pos, True Pred Neg ...
         # ... for all classes, in this order, flattened. First RpRnTpTn are for 'WHOLE' class.
         arr_RpRnTpTn_per_class = np.asarray(list_RpRnPpPn_per_class, dtype="int32")
@@ -101,6 +93,8 @@ def process_in_batches(log,
         costs_of_batches.append(cost_this_batch)  # only really used in training.
         arr_RpRnTpTn_per_class_in_subep += arr_RpRnTpTn_per_class
 
+        print_progress_step_tr_val(log, n_batches, batch_i + 1, batchsize, prefix_progress_str)
+        
     # ======== Calculate and Report accuracy over subepoch
     # In case of validation, mean_cost_subep is just a placeholder.
     # Cause this does not get calculated and reported in this case.
@@ -173,8 +167,11 @@ def do_training(sessionTf,
 
                 # -------- Pre-processing ------
                 pad_input,
-                norm_prms
-                ):
+                norm_prms,
+                #--------- Sampling Hyperparamas -----
+                inp_shapes_per_path_train,
+                inp_shapes_per_path_val,
+                inp_shapes_per_path_test):
     id_str = "[MAIN|PID:" + str(os.getpid()) + "]"
     start_time_train = time.time()
 
@@ -190,6 +187,9 @@ def do_training(sessionTf,
                             max_n_cases_per_subep_train,
                             n_samples_per_subep_train,
                             sampling_type_inst_tr,
+                            inp_shapes_per_path_train,
+                            cnn3d.calc_outp_dims_given_inp(inp_shapes_per_path_train[0]),
+                            cnn3d.calc_unpredicted_margin(inp_shapes_per_path_train[0]),
                             paths_per_chan_per_subj_train,
                             paths_to_lbls_per_subj_train,
                             paths_to_masks_per_subj_train,
@@ -207,6 +207,9 @@ def do_training(sessionTf,
                              max_n_cases_per_subep_train,
                              n_samples_per_subep_val,
                              sampling_type_inst_val,
+                             inp_shapes_per_path_val,
+                             cnn3d.calc_outp_dims_given_inp(inp_shapes_per_path_val[0]),
+                             cnn3d.calc_unpredicted_margin(inp_shapes_per_path_val[0]),
                              paths_per_chan_per_subj_val,
                              paths_to_lbls_per_subj_val,
                              paths_to_masks_per_subj_val,
@@ -229,21 +232,19 @@ def do_training(sessionTf,
         while n_eps_trained_model < n_epochs:
             epoch = n_eps_trained_model
 
-            tb_log_tr = tensorboard_loggers['train'] if tensorboard_loggers is not None else None
             acc_monitor_ep_tr = AccuracyMonitorForEpSegm(log, 0,
                                                          n_eps_trained_model,
                                                          cnn3d.num_classes,
                                                          n_subepochs,
-                                                         tb_log_tr)
+                                                         tensorboard_loggers['train'])
 
-            tb_log_val = tensorboard_loggers['val'] if tensorboard_loggers is not None else None
             acc_monitor_ep_val = None
             if val_on_samples or val_on_whole_volumes:
                 acc_monitor_ep_val = AccuracyMonitorForEpSegm(log, 1,
                                                               n_eps_trained_model,
                                                               cnn3d.num_classes,
                                                               n_subepochs,
-                                                              tb_log_val)
+                                                              tensorboard_loggers['val'])
             
             val_on_whole_vols_after_this_ep = False
             if val_on_whole_volumes and (n_eps_trained_model + 1) % n_epochs_between_val_on_whole_vols == 0:
@@ -399,7 +400,8 @@ def do_training(sessionTf,
                                                                          # Saving feature maps
                                                                          save_fms_flag,
                                                                          idxs_fms_to_save,
-                                                                         namesForSavingFms)
+                                                                         namesForSavingFms,
+                                                                         inp_shapes_per_path_test)
                 
                 acc_monitor_ep_val.report_metrics_whole_vols(mean_metrics_val_whole_vols)
 
